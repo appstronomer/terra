@@ -1,0 +1,156 @@
+#! /bin/sh
+
+# check if all required non-POSIX commands exist
+exit_status=0
+for item in readlink docker ; do 
+    if ! command -v "${item}" --version > /dev/null 2>&1; then 
+        exit_status=1
+        echo "error: required command \"${item}\" not found;"
+    fi
+done
+if [ $exit_status -ne 0 ]; then
+    echo '[FAILURE]: please install not found commands using your package manager';
+    exit $exit_status;
+fi
+
+
+# base values
+default_net=terra-local-bridge
+default_image_prefix=terra-
+dir_base=$(
+    base=${0}
+    while [ -L "${base}" ]
+    do
+        cd "${base%/*}"
+        base=$(readlink "${base}")
+    done
+    cd "${base%/*}"
+    echo $(pwd -P)
+)
+
+
+# navigate through commands
+if [ "$1" = "run" ]; then
+    if [ ! -z $2 ]; then
+        startup_repo=$2
+        startup_args=''
+        tmp=2
+        for item in $@ ; do 
+            test $tmp -lt 1  && startup_args="${startup_args} ${item}" || tmp=$(($tmp-1))
+        done
+    else
+        exit_status=2
+    fi
+elif [ "$1" = "help" ] || [ "$1" = "--help" ]; then
+    cat $dir_base/help.txt
+elif [ ! -z $1 ]; then
+    startup_repo=$1
+    startup_args=''
+    tmp=1
+    for item in $@ ; do 
+        test $tmp -lt 1  && startup_args="${startup_args} ${item}" || tmp=$(($tmp-1))
+    done
+else
+    exit_status=2
+fi
+
+
+# interrupt if no command set
+if [ -z $startup_repo ]; then
+    if [ $exit_status -eq 2 ]; then cat $dir_base/help.txt; fi
+    exit $exit_status
+fi
+
+
+# build image if needed and get its id
+image_name="${default_image_prefix}${startup_repo}:latest"
+image_id=$(docker image ls -q "${image_name}" 2> /dev/null)
+image_dir="${dir_base}/images/${startup_repo}"
+if [ $? -eq 0 ]; then
+    if [ -z $image_id ]; then
+        if echo "${startup_repo}" | grep -Eq '^[0-9A-Za-z_-]+$' ; then
+            echo "info: building image \"${startup_repo}\";"
+            image_id=$(docker build -q -t "${image_name}" "${image_dir}" 2> /dev/null)
+            if [ $? -ne 0 ] || [ -z $image_id ] ; then
+                exit_status=1
+                echo "error: unable to build \"${startup_repo}\" with \"${image_name}\" name from \"${image_dir}\" directory;"
+            fi
+        else 
+            exit_status=1
+            echo "error: \"${startup_repo}\" image name doesn't match \"^[0-9A-Za-z_-]+$\" regex pattern;"        
+        fi
+    fi
+else
+    exit_status=1
+    echo "error: unable to search in images list;"
+fi
+
+if [ $exit_status -ne 0 ]; then
+    echo '[FAILURE]: please check that required image is valid and presents in "images" directory;';
+    exit $exit_status;
+fi
+
+
+# create volume dir if needed
+if [ ! -e "${image_dir}/volume" ]; then
+    if mkdir "${image_dir}/volume" > /dev/null 2>&1; then
+        if ! echo "*\n!.gitignore" > "${image_dir}/volume/.gitignore"; then
+            echo "warn: unable to make .gitignore file for ${startup_repo} global volume directory: \"${image_dir}/volume\";"
+        fi
+    else
+        exit_status=1
+        echo "error: unable to make ${startup_repo} global volume directory: \"${image_dir}/volume\";"
+    fi
+elif [ -f "${image_dir}/volume" ]; then 
+    exit_status=1
+    echo "error: ${startup_repo} global volume path is not a directory: \"${image_dir}/volume\";"
+fi
+
+if [ $exit_status -ne 0 ]; then
+    echo "[FAILURE]: please check that ${startup_repo} global volume directory is accessible;"
+    exit $exit_status
+fi
+
+
+# create network if needed and get its id
+network_id=$(docker network ls -q -f name="${default_net}")
+if [ $? -eq 0 ]; then
+    if [ -z $network_id ]; then
+        echo "info: creating network \"${default_net}\""
+        network_id=$(docker network create "${default_net}" 2> /dev/null)
+        if [ $? -ne 0 ]; then
+            network_id=$(docker network ls -q -f name="${default_net}" 2> /dev/null)
+            if [ $? -ne 0 ] || [ -z $network_id ]; then
+                exit_status=1
+                echo "error: unable to create network \"${default_net}\";"
+            fi
+        fi
+    fi
+else
+    exit_status=1
+    echo "error: unable to check \"${default_net}\" network presence"
+fi
+if [ $exit_status -ne 0 ]; then
+    echo "[FAILURE]: please remove \"${default_net}\" docker network and restart the process";
+    exit $exit_status;
+fi
+
+
+eval "docker run --rm -it --network \"${network_id}\" -u \"$(id -u):$(id -g)\" -v /etc/passwd:/etc/passwd:ro -v /etc/group:/etc/group:ro -v /etc/shadow:/etc/shadow:ro -v \"$(pwd):/project\" -v \"${dir_base}/images/${startup_repo}/volume:/volume\" -w /project ${startup_args} \"${image_id}\" /bin/sh"
+exit_status=$?
+
+# code to remove previosely created network
+# MIMIC_NET_COUNT=$(docker network inspect --format '{{len .Containers}}' $network_id 2> /dev/null)
+# if [ $? -eq 0 ]; then
+#     if [ "${MIMIC_NET_COUNT}" = "0" ]; then
+#         if ! docker network rm "${network_id}" > /dev/null 2> /dev/null ; then
+#             exit_status=$?
+#             echo "warn: unable to remove \"${default_net}\" network after all containers disconnect"
+#         fi
+#     fi
+# else
+#     exit_status=$?
+#     echo "warn: unable to get \"${default_net}\" connections count before removing it"
+# fi
+
+exit $exit_status
